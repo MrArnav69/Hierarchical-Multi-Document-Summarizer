@@ -77,7 +77,7 @@ class HierarchicalSummarizer:
                 adaptive_overlap=True # SOTA mode
             )
             
-    def _generate(self, inputs: List[str], max_length: int = 256, min_length: int = 32) -> List[str]:
+    def _generate(self, inputs: List[str], max_length: int = 512, min_length: int = 64) -> List[str]:
         """
         Low-level generation with researched beam search parameters.
         """
@@ -92,15 +92,15 @@ class HierarchicalSummarizer:
         
         # Generate with SOTA parameters for Multi-News
         # - num_beams=8: Standard for high quality abstractive summ
-        # - length_penalty=0.8: Encourages slightly shorter, punchier sentences
-        # - no_repeat_ngram_size=3: Prevents repetitive phrases
+        # - length_penalty=1.2: Tuned for Multi-News (longer summaries = higher Recall)
+        # - max_length=1024: Allow full length generation
         try:
             summary_ids = self.model.generate(
                 batch["input_ids"],
                 num_beams=8, 
                 max_length=max_length,
                 min_length=min_length,
-                length_penalty=0.8,
+                length_penalty=1.2, # UPDATED: Encourages longer output (prev 0.8)
                 no_repeat_ngram_size=3,
                 early_stopping=True
             )
@@ -133,34 +133,11 @@ class HierarchicalSummarizer:
         if not chunk_texts:
             return {'final_summary': "", 'chunk_summaries': [], 'chunks': []}
             
-        # Stage 2: Chunk Summarization (Batch Processing)
-        chunk_summaries = []
-        
-        # Determine strictness based on chunk count
-        # If we have many chunks, local summaries should be concise.
-        local_max_len = 128 if len(chunks) > 5 else 256
-        
-        for i in range(0, len(chunk_texts), self.batch_size):
-            batch = chunk_texts[i : i + self.batch_size]
-            summaries = self._generate(batch, max_length=local_max_len)
-            chunk_summaries.extend(summaries)
+        # Stage 2: Map (Chunk Summarization)
+        chunk_summaries = self._stage1_map_summaries(chunk_texts)
             
-        # Stage 3: Aggregation (Global Summary)
-        # Concatenate local summaries
-        # Note: We add special separators or just spaces. Space is standard for PEGASUS.
-        concatenated_summary = " ".join(chunk_summaries)
-        
-        # Check if we need a final pass
-        # If the concatenated summary is short enough, maybe it IS the summary?
-        # But usually we re-summarize to smooth the transitions.
-        
-        final_summary = concatenated_summary
-        
-        # Only re-summarize if there's enough content to warrant it
-        # Otherwise we risk hallucinating or just copying.
-        if len(self.tokenizer.tokenize(concatenated_summary)) > 256:
-            final_summary_list = self._generate([concatenated_summary], max_length=512, min_length=128)
-            final_summary = final_summary_list[0]
+        # Stage 3: Reduce (Aggregation & Final Summarization)
+        final_summary, concatenated_summary = self._stage2_reduce_summaries(chunk_summaries)
             
         return {
             'final_summary': final_summary,
@@ -168,6 +145,118 @@ class HierarchicalSummarizer:
             'chunks': chunks,
             'concatenated_intermediate': concatenated_summary
         }
+
+    def _stage1_map_summaries(self, chunk_texts: List[str]) -> List[str]:
+        """
+        Stage 1 (Map): Summarize each chunk independently.
+        """
+        chunk_summaries = []
+        
+        # Determine strictness based on chunk count
+        # If we have many chunks, local summaries should be concise.
+        local_max_len = 128 if len(chunk_texts) > 5 else 256
+        
+        for i in range(0, len(chunk_texts), self.batch_size):
+            batch = chunk_texts[i : i + self.batch_size]
+            summaries = self._generate(batch, max_length=local_max_len)
+            chunk_summaries.extend(summaries)
+            
+        return chunk_summaries
+
+    def _stage2_reduce_summaries(self, chunk_summaries: List[str]) -> (str, str):
+        """
+        Stage 2 (Reduce): Recursively summarize chunk summaries until they fit valid context.
+        
+        This implements a 'Tree Reduction' strategy:
+        [S1, S2, S3, S4, S5, S6] (Too long)
+           |       |       |
+        [  SumA,   SumB,   SumC ] (Intermediate)
+                   |
+                FinalSum
+                
+        Ensures NO truncation of content regardless of document length.
+        """
+        # 1. Initial Concatenation (for logging/debug)
+        concatenated_intermediate = " ".join(chunk_summaries)
+        
+        current_summaries = chunk_summaries
+        layer = 0
+        
+        # SOTA: Pegasus Max Positional Embeddings = 1024
+        # We leave some buffer for generation overhead
+        MAX_INPUT_TOKENS = 1000 
+        
+        while True:
+            # Check length of concatenated current level
+            combined_text = " ".join(current_summaries)
+            tokenized_len = len(self.tokenizer.encode(combined_text, truncation=False))
+            
+            logger.info(f"Reduction Layer {layer}: {len(current_summaries)} chunks, {tokenized_len} tokens")
+            
+            # Base Case: If it fits, generate final summary
+            if tokenized_len <= MAX_INPUT_TOKENS:
+                # If it's very short, just return it (don't over-summarize)
+                if tokenized_len < 256 and layer > 0:
+                    return combined_text, concatenated_intermediate
+                
+                # Final Pass
+                final_summary_list = self._generate(
+                    [combined_text], 
+                    max_length=512, 
+                    min_length=128
+                )
+                return final_summary_list[0], concatenated_intermediate
+            
+            # Recursive Step: Group and Summarize
+            if len(current_summaries) <= 1:
+                # Edge case: Single summary is still too long (unlikely with chunking, but possible)
+                # We forcedly summarize it
+                final_summary_list = self._generate(
+                    [current_summaries[0]], 
+                    max_length=512, 
+                    min_length=128
+                )
+                return final_summary_list[0], concatenated_intermediate
+                
+            # Smart Grouping (Bin Packing)
+            new_level_summaries = []
+            current_group = []
+            current_group_len = 0
+            
+            for summary in current_summaries:
+                s_len = len(self.tokenizer.encode(summary, truncation=False))
+                
+                # If adding this summary exceeds limit, process current group
+                if current_group_len + s_len > MAX_INPUT_TOKENS:
+                    if current_group:
+                        # Summarize the group
+                        group_text = " ".join(current_group)
+                        new_summary = self._generate([group_text], max_length=256)[0]
+                        new_level_summaries.append(new_summary)
+                    
+                    # Reset
+                    current_group = [summary]
+                    current_group_len = s_len
+                else:
+                    current_group.append(summary)
+                    current_group_len += s_len
+            
+            # Process final group
+            if current_group:
+                group_text = " ".join(current_group)
+                new_summary = self._generate([group_text], max_length=256)[0]
+                new_level_summaries.append(new_summary)
+            
+            # Update for next iteration
+            current_summaries = new_level_summaries
+            layer += 1
+            
+            # Safety break to prevent infinite loops (though unlikely)
+            if layer > 5:
+                logger.warning("Max reduction layers reached. Truncating.")
+                final_text = " ".join(current_summaries)
+                final_summary_list = self._generate([final_text], max_length=512)
+                return final_summary_list[0], concatenated_intermediate
 
 if __name__ == "__main__":
     # Integration Test

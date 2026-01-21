@@ -1,0 +1,12 @@
+{
+  "num_samples": 20,
+  "device": "mps",
+  "inference_time": 95.49749708175659,
+  "avg_time_per_sample": 4.774874854087829,
+  "metrics": {
+    "rouge1": 0.07808901084909989,
+    "rouge2": 0.017525354969574036,
+    "rougeL": 0.04402968823423221
+  },
+  "config": "Hierarchical PEGASUS (SOTA Chunking, Optimized)"
+}
